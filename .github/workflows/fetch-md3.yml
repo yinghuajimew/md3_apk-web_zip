@@ -1,90 +1,135 @@
-name: Fetch and Release Latest MD3 (Web & App)
+name: Fetch MD3 Artifacts (Local Mirror Repo)
 
 on:
   schedule:
     - cron: '0 0 * * *' # 每天自动执行
-  workflow_dispatch: # 手动触发
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: '强制拉取(无视版本一致性检查)'
+        type: boolean
+        default: false
 
 jobs:
-  build-and-release:
+  mirror-and-release:
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Fetch Latest MD3 Versions (Web & App)
-        id: fetch_md3
+      - name: Check and Compare Versions (对比最新官方版本)
+        id: check_versions
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. 获取 Web 网页端最新版本号
-          WEB_VERSION=$(curl -s https://api.github.com/repos/material-components/material-web/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ -z "$WEB_VERSION" ]; then WEB_VERSION="web-v1.0.0"; fi
+          # 1. 直接读取 Google Maven 服务器上的 metadata 获取 Android 最新真实版本 (例如 1.12.0)
+          APP_VERSION=$(curl -s https://dl.google.com/dl/android/maven2/com/google/android/material/material/maven-metadata.xml | grep -oP '<release>\K[^<]+')
           
-          # 2. 获取 App 应用端 (Android) 最新版本号
-          APP_VERSION=$(curl -s https://api.github.com/repos/material-components/material-components-android/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ -z "$APP_VERSION" ]; then APP_VERSION="app-1.12.0"; fi
+          # 2. 从 NPM 官方 Registry 获取 Web 最新正式版本
+          WEB_VERSION=$(npm view @material/web version)
 
-          echo "Web Version: $WEB_VERSION"
-          echo "App Version: $APP_VERSION"
+          [ -z "$APP_VERSION" ] && APP_VERSION="unknown-app"
+          [ -z "$WEB_VERSION" ] && WEB_VERSION="unknown-web"
 
-          # 3. 分别拉取两端源码
-          git clone --depth 1 --branch $WEB_VERSION https://github.com/material-components/material-web.git md3_web
-          git clone --depth 1 --branch $APP_VERSION https://github.com/material-components/material-components-android.git md3_app
+          UPSTREAM_COMBO="${WEB_VERSION}_${APP_VERSION}"
+          echo "官方最新二进制版本: $UPSTREAM_COMBO"
 
-          # 4. 生成混合版本号 (网页版号_应用版号_时间戳)，确保标记唯一且对应拉取版本
-          TIME_MARKER=$(date +'%Y%m%d-%H%M')
-          OUR_TAG="${WEB_VERSION}_${APP_VERSION}-build.${TIME_MARKER}"
+          LATEST_RELEASE=$(gh release view --json tagName -q ".tagName" 2>/dev/null || echo "none")
+          CURRENT_COMBO=$(echo "$LATEST_RELEASE" | sed -E 's/-build\..*//')
 
-          echo "web_version=$WEB_VERSION" >> $GITHUB_OUTPUT
-          echo "app_version=$APP_VERSION" >> $GITHUB_OUTPUT
-          echo "our_tag=$OUR_TAG" >> $GITHUB_OUTPUT
+          FORCE_RUN="${{ inputs.force_run }}"
+          if [ "$UPSTREAM_COMBO" == "$CURRENT_COMBO" ] && [ "$FORCE_RUN" != "true" ]; then
+            echo "✅ 官方成品库无更新，停止镜像同步。"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "🚀 发现新版本二进制包，准备下载镜像！"
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "web_version=$WEB_VERSION" >> $GITHUB_OUTPUT
+            echo "app_version=$APP_VERSION" >> $GITHUB_OUTPUT
+            TIME_MARKER=$(date +'%Y%m%d-%H%M')
+            echo "our_tag=${UPSTREAM_COMBO}-build.${TIME_MARKER}" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Package to ZIP
+      - name: Download Artifacts (构建离线镜像仓库结构)
+        if: steps.check_versions.outputs.skip == 'false'
         run: |
-          # 5. 分别打包成两个 ZIP，排除不需要的 git 隐藏文件
-          cd md3_web
-          zip -r ../md3-web-assets.zip . -x "*.git*"
-          cd ../md3_app
-          zip -r ../md3-app-assets.zip . -x "*.git*"
-          cd ..
+          APP_V=${{ steps.check_versions.outputs.app_version }}
+          WEB_V=${{ steps.check_versions.outputs.web_version }}
 
-      - name: Create Release and Upload ZIPs
+          # ==========================================
+          # 📦 1. 构建 Android 本地 Maven 镜像库
+          # ==========================================
+          # 创建标准的 Maven 路径结构
+          MAVEN_DIR="md3-android-repo/com/google/android/material/material/$APP_V"
+          mkdir -p $MAVEN_DIR
+          cd $MAVEN_DIR
+          
+          # 从 Google Maven 直接拉取一堆 AAR, POM, JAR 文件
+          BASE_URL="https://dl.google.com/dl/android/maven2/com/google/android/material/material/$APP_V"
+          curl -sLO "$BASE_URL/material-$APP_V.aar"
+          curl -sLO "$BASE_URL/material-$APP_V.pom"
+          curl -sLO "$BASE_URL/material-$APP_V-sources.jar"
+          curl -sLO "$BASE_URL/material-$APP_V.module"
+          
+          # 退回根目录，打包成 zip
+          cd ../../../../../../../
+          zip -r md3-android-maven-repo.zip md3-android-repo
+
+          # ==========================================
+          # 📦 2. 构建 Web NPM 本地镜像包
+          # ==========================================
+          mkdir md3-web-pkg
+          cd md3-web-pkg
+          # 直接下载 npm 官方编译压缩包 (.tgz) 并解压成可以直接依赖的文件结构
+          npm pack @material/web@$WEB_V
+          tar -xzf *.tgz --strip-components=1
+          rm *.tgz
+          
+          # 退回根目录，打包成 zip
+          cd ..
+          zip -r md3-web-npm-pkg.zip md3-web-pkg
+
+      - name: Create Release
+        if: steps.check_versions.outputs.skip == 'false'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.fetch_md3.outputs.our_tag }}
-          name: "MD3 核心资源包 (Web: ${{ steps.fetch_md3.outputs.web_version }} | App: ${{ steps.fetch_md3.outputs.app_version }})"
+          tag_name: ${{ steps.check_versions.outputs.our_tag }}
+          name: "MD3 官方二进制离线包 (Web: ${{ steps.check_versions.outputs.web_version }} | App: ${{ steps.check_versions.outputs.app_version }})"
           body: |
-            自动拉取的最新 Material Design 3 (MD3) 源码资源包。
-            包含 **网页端(Web)** 和 **应用端(Android App)** 两个独立压缩包。
-            - 🌐 **Web 官方版本**: `${{ steps.fetch_md3.outputs.web_version }}`
-            - 📱 **App 官方版本**: `${{ steps.fetch_md3.outputs.app_version }}`
-            - 🔖 **打包标记**: `${{ steps.fetch_md3.outputs.our_tag }}`
+            自动拉取的 Google 官方最新 MD3 编译成品（AAR/JAR 与 NPM 包），纯净镜像仓库体验！
+            - 🌐 **Web 版本**: `${{ steps.check_versions.outputs.web_version }}`
+            - 📱 **App 版本**: `${{ steps.check_versions.outputs.app_version }}`
+            - 🔖 **发布标识**: `${{ steps.check_versions.outputs.our_tag }}`
 
             ---
 
-            ### 💡 极简使用指南（一行代码引导）
-            
-            #### 👉 如果你开发 网页 / 前端 (Web)
-            1. 下载底部的 `md3-web-assets.zip`，解压放入项目根目录，命名为 `md3-web-lib`。
-            2. 在你的 `package.json` 添加一行路径引导：
-               ```json
-               "dependencies": {
-                 "md3-web": "file:./md3-web-lib"
+            ### 💡 极简使用指南（一行路径引入）
+
+            #### 👉 Android / 应用开发 (纯正的本地 Maven 玩法)
+            1. 下载 `md3-android-maven-repo.zip` 并解压到项目根目录（文件夹名为 `md3-android-repo`）。
+            2. 在你的 `settings.gradle` (或根目录 `build.gradle`) 的仓库列表中，**加一行本地路径**：
+               ```gradle
+               dependencyResolutionManagement {
+                   repositories {
+                       google()
+                       mavenCentral()
+                       // 加这一行，指向你解压的文件夹！
+                       maven { url uri("$rootDir/md3-android-repo") }
+                   }
                }
                ```
-            *(执行 `npm install` 后即可直接使用)*
+            3. 正常使用即可，无需编译源码，速度极快：
+               `implementation 'com.google.android.material:material:${{ steps.check_versions.outputs.app_version }}'`
 
-            #### 👉 如果你开发 应用 / 安卓 (App)
-            1. 下载底部的 `md3-app-assets.zip`，解压放入项目根目录，命名为 `md3-app-lib`。
-            2. 在你的 `settings.gradle` 中添加一行路径引导：
-               ```gradle
-               includeBuild('./md3-app-lib')
+            #### 👉 Web / 前端开发
+            1. 下载 `md3-web-npm-pkg.zip` 解压到项目根目录，命名为 `md3-web-pkg`。
+            2. 在你的 `package.json` 中添加**一行路径引入**：
+               ```json
+               "dependencies": {
+                 "@material/web": "file:./md3-web-pkg"
+               }
                ```
-            *(同步 Gradle 后，即可在项目中直接依赖该本地源码库)*
+            3. 执行 `npm install` 即可！
           files: |
-            md3-web-assets.zip
-            md3-app-assets.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            md3-android-maven-repo.zip
+            md3-web-npm-pkg.zip
