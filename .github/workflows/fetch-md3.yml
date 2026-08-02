@@ -1,0 +1,90 @@
+name: Fetch and Release Latest MD3 (Web & App)
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # 每天自动执行
+  workflow_dispatch: # 手动触发
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch Latest MD3 Versions (Web & App)
+        id: fetch_md3
+        run: |
+          # 1. 获取 Web 网页端最新版本号
+          WEB_VERSION=$(curl -s https://api.github.com/repos/material-components/material-web/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$WEB_VERSION" ]; then WEB_VERSION="web-v1.0.0"; fi
+          
+          # 2. 获取 App 应用端 (Android) 最新版本号
+          APP_VERSION=$(curl -s https://api.github.com/repos/material-components/material-components-android/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$APP_VERSION" ]; then APP_VERSION="app-1.12.0"; fi
+
+          echo "Web Version: $WEB_VERSION"
+          echo "App Version: $APP_VERSION"
+
+          # 3. 分别拉取两端源码
+          git clone --depth 1 --branch $WEB_VERSION https://github.com/material-components/material-web.git md3_web
+          git clone --depth 1 --branch $APP_VERSION https://github.com/material-components/material-components-android.git md3_app
+
+          # 4. 生成混合版本号 (网页版号_应用版号_时间戳)，确保标记唯一且对应拉取版本
+          TIME_MARKER=$(date +'%Y%m%d-%H%M')
+          OUR_TAG="${WEB_VERSION}_${APP_VERSION}-build.${TIME_MARKER}"
+
+          echo "web_version=$WEB_VERSION" >> $GITHUB_OUTPUT
+          echo "app_version=$APP_VERSION" >> $GITHUB_OUTPUT
+          echo "our_tag=$OUR_TAG" >> $GITHUB_OUTPUT
+
+      - name: Package to ZIP
+        run: |
+          # 5. 分别打包成两个 ZIP，排除不需要的 git 隐藏文件
+          cd md3_web
+          zip -r ../md3-web-assets.zip . -x "*.git*"
+          cd ../md3_app
+          zip -r ../md3-app-assets.zip . -x "*.git*"
+          cd ..
+
+      - name: Create Release and Upload ZIPs
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.fetch_md3.outputs.our_tag }}
+          name: "MD3 核心资源包 (Web: ${{ steps.fetch_md3.outputs.web_version }} | App: ${{ steps.fetch_md3.outputs.app_version }})"
+          body: |
+            自动拉取的最新 Material Design 3 (MD3) 源码资源包。
+            包含 **网页端(Web)** 和 **应用端(Android App)** 两个独立压缩包。
+            - 🌐 **Web 官方版本**: `${{ steps.fetch_md3.outputs.web_version }}`
+            - 📱 **App 官方版本**: `${{ steps.fetch_md3.outputs.app_version }}`
+            - 🔖 **打包标记**: `${{ steps.fetch_md3.outputs.our_tag }}`
+
+            ---
+
+            ### 💡 极简使用指南（一行代码引导）
+            
+            #### 👉 如果你开发 网页 / 前端 (Web)
+            1. 下载底部的 `md3-web-assets.zip`，解压放入项目根目录，命名为 `md3-web-lib`。
+            2. 在你的 `package.json` 添加一行路径引导：
+               ```json
+               "dependencies": {
+                 "md3-web": "file:./md3-web-lib"
+               }
+               ```
+            *(执行 `npm install` 后即可直接使用)*
+
+            #### 👉 如果你开发 应用 / 安卓 (App)
+            1. 下载底部的 `md3-app-assets.zip`，解压放入项目根目录，命名为 `md3-app-lib`。
+            2. 在你的 `settings.gradle` 中添加一行路径引导：
+               ```gradle
+               includeBuild('./md3-app-lib')
+               ```
+            *(同步 Gradle 后，即可在项目中直接依赖该本地源码库)*
+          files: |
+            md3-web-assets.zip
+            md3-app-assets.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
