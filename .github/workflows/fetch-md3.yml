@@ -25,7 +25,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. 获取 Android 与 Web 最新版本
           APP_VERSION=$(curl -s https://dl.google.com/dl/android/maven2/com/google/android/material/material/maven-metadata.xml | grep -oP '<release>\K[^<]+')
           WEB_VERSION=$(npm view @material/web version)
 
@@ -35,7 +34,6 @@ jobs:
           UPSTREAM_COMBO="${WEB_VERSION}_${APP_VERSION}"
           echo "官方最新二进制版本: $UPSTREAM_COMBO"
 
-          # 2. 对比当前仓库的最新版本
           LATEST_RELEASE=$(gh release view --json tagName -q ".tagName" 2>/dev/null || echo "none")
           CURRENT_COMBO=$(echo "$LATEST_RELEASE" | sed -E 's/-build\..*//')
 
@@ -61,49 +59,75 @@ jobs:
           # ==========================================
           # 📦 1. 构建 Android 本地 Maven 胖镜像库 (Fat Mirror)
           # ==========================================
-          mkdir md3-maven-resolver
-          cd md3-maven-resolver
           
-          # 动态生成 POM 文件触发 Maven 递归下载依赖树
-          cat <<EOF > pom.xml
-          <project>
-            <modelVersion>4.0.0</modelVersion>
-            <groupId>com.example</groupId>
-            <artifactId>mirror</artifactId>
-            <version>1.0</version>
-            <packaging>pom</packaging>
-            <repositories>
-              <repository><id>google</id><url>https://maven.google.com/</url></repository>
-              <repository><id>central</id><url>https://repo1.maven.org/maven2/</url></repository>
-            </repositories>
-            <dependencies>
-              <dependency>
-                <groupId>com.google.android.material</groupId>
-                <artifactId>material</artifactId>
-                <version>${APP_V}</version>
-                <type>aar</type>
-              </dependency>
-            </dependencies>
-          </project>
+          # 清理 Action 服务器上的遗留 Gradle 缓存，确保提取纯净
+          rm -rf ~/.gradle/caches/modules-2/files-2.1
+          
+          mkdir md3-gradle-resolver
+          cd md3-gradle-resolver
+          
+          # 1.1 动态创建一个极简的、原生的 Gradle 工程
+          cat <<EOF > build.gradle
+          repositories {
+              google()
+              mavenCentral()
+          }
+          configurations {
+              md3
+          }
+          dependencies {
+              md3 "com.google.android.material:material:${APP_V}"
+          }
+          task fetch {
+              doLast {
+                  // 这一步会让 Gradle 按照 Android 的规则完美处理冲突，并下载所有的 AAR、JAR 和 POM
+                  configurations.md3.resolve()
+              }
+          }
           EOF
           
-          # 利用 Maven 引擎将整棵依赖树(包含所有的 androidx 包)拉取到我们指定的目录中
-          mvn dependency:resolve -Dmaven.repo.local=${{ github.workspace }}/md3-android-repo
+          # 1.2 执行 Gradle 任务进行依赖解析与下载
+          gradle fetch --no-daemon
           
-          # 补齐 MD3 自身的 Gradle 专属文件 (sources.jar 和 .module)
-          cd ${{ github.workspace }}/md3-android-repo/com/google/android/material/material/$APP_V
+          # 1.3 构建目标 Maven 镜像库结构
+          TARGET_DIR="${{ github.workspace }}/md3-android-repo"
+          mkdir -p "$TARGET_DIR"
+          
+          # 1.4 【黑科技核心】遍历杂乱的 Gradle 缓存，剥离 hash 文件夹，重组为完美的 Maven 仓库
+          find ~/.gradle/caches/modules-2/files-2.1/ -type f | while read -r filepath; do
+              # 过滤非必要文件
+              [[ "$filepath" != *"/files-2.1/"* ]] && continue
+              
+              # 截取相对路径 (如: androidx.core/core/1.13.0/abc123hash/core-1.13.0.aar)
+              relpath="${filepath#*/files-2.1/}"
+              IFS='/' read -ra parts <<< "$relpath"
+              
+              # 确保深度足够 (groupId/artifactId/version/hash/filename)
+              if [ ${#parts[@]} -lt 5 ]; then continue; fi
+              
+              group_id="${parts[0]}"
+              artifact_id="${parts[1]}"
+              version="${parts[2]}"
+              filename="${parts[4]}"
+              
+              # 转换 Group ID 为路径格式 (androidx.core -> androidx/core)
+              group_path="${group_id//.//}"
+              dest_dir="$TARGET_DIR/$group_path/$artifact_id/$version"
+              
+              # 复制文件到最终的 Maven 结构中
+              mkdir -p "$dest_dir"
+              cp "$filepath" "$dest_dir/$filename"
+          done
+          
+          # 1.5 手动兜底：补齐 MD3 自身的特殊文件（Sources 源码 和 Module 描述文件）
+          cd "$TARGET_DIR/com/google/android/material/material/$APP_V"
           BASE_URL="https://dl.google.com/dl/android/maven2/com/google/android/material/material/$APP_V"
-          curl -sLO "$BASE_URL/material-$APP_V-sources.jar"
-          curl -sLO "$BASE_URL/material-$APP_V.module"
+          curl -sLO "$BASE_URL/material-$APP_V-sources.jar" || true
+          curl -sLO "$BASE_URL/material-$APP_V.module" || true
+          curl -sLO "$BASE_URL/material-$APP_V.pom" || true
           
-          # 退回根目录，剔除 Maven 引擎执行时下载的无关编译插件
+          # 1.6 打包 Android 全量镜像库
           cd ${{ github.workspace }}
-          rm -rf md3-android-repo/org/apache
-          rm -rf md3-android-repo/org/codehaus
-          rm -rf md3-android-repo/org/sonatype
-          rm -rf md3-android-repo/org/eclipse
-          
-          # 打包 Android 全量镜像库
           zip -r md3-android-maven-repo.zip md3-android-repo
 
           # ==========================================
@@ -126,7 +150,7 @@ jobs:
           tag_name: ${{ steps.check_versions.outputs.our_tag }}
           name: "MD3 官方全量镜像包 (Web: ${{ steps.check_versions.outputs.web_version }} | App: ${{ steps.check_versions.outputs.app_version }})"
           body: |
-            自动拉取的 Google 官方最新 MD3 编译成品，**包含完整的底层依赖树（胖镜像）**！
+            自动拉取的 Google 官方最新 MD3 编译成品，**包含完整的底层依赖树（完美兼容 Gradle 的胖镜像）**！
             - 🌐 **Web 版本**: `${{ steps.check_versions.outputs.web_version }}`
             - 📱 **App 版本**: `${{ steps.check_versions.outputs.app_version }}`
             - 🔖 **发布标识**: `${{ steps.check_versions.outputs.our_tag }}`
@@ -143,23 +167,23 @@ jobs:
                    repositories {
                        google()
                        mavenCentral()
-                       // 添加下面这行，指向你解压的文件夹，彻底离线可用！
+                       // 添加下面这行，彻底离线可用！
                        maven { url uri("$rootDir/md3-android-repo") }
                    }
                }
                ```
-            3. 在 App 的 `build.gradle` 中正常引入：
+            3. 在 App 中正常引入：
                `implementation 'com.google.android.material:material:${{ steps.check_versions.outputs.app_version }}'`
 
             #### 👉 Web / 前端开发
-            1. 下载 `md3-web-npm-pkg.zip` 解压到项目根目录，命名为 `md3-web-pkg`。
-            2. 在你的 `package.json` 中添加**一行路径引入**：
+            1. 下载 `md3-web-npm-pkg.zip` 解压到项目根目录命名为 `md3-web-pkg`。
+            2. 在你的 `package.json` 中添加：
                ```json
                "dependencies": {
                  "@material/web": "file:./md3-web-pkg"
                }
                ```
-            3. 执行 `npm install` 即可使用！
+            3. 执行 `npm install` 即可！
           files: |
             md3-android-maven-repo.zip
             md3-web-npm-pkg.zip
