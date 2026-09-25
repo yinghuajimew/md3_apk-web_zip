@@ -189,3 +189,6 @@ jobs:
             md3-web-npm-pkg.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Keepalive Workflow
+        uses: gautamkrishnar/keepalive-workflow@v2
