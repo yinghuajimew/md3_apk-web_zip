@@ -190,5 +190,23 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Keepalive Workflow
-        uses: gautamkrishnar/keepalive-workflow@v2
+      # ==========================================
+      # 🛡️ 原生防冻结保活脚本 (安全、不依赖第三方)
+      # ==========================================
+      - name: Keepalive Workflow (Native)
+        run: |
+          LAST_COMMIT_DATE=$(git log -1 --format=%ct)
+          CURRENT_DATE=$(date +%s)
+          DIFF_DAYS=$(( (CURRENT_DATE - LAST_COMMIT_DATE) / 86400 ))
+          echo "距离上次提交已过去 $DIFF_DAYS 天"
+          
+          if [ "$DIFF_DAYS" -ge 50 ]; then
+            echo "超过 50 天无活动，准备创建保活空提交..."
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            # 创建一个不包含任何文件修改的空提交
+            git commit --allow-empty -m "chore: auto keep active to prevent workflow suspension"
+            git push
+          else
+            echo "未超过 50 天，无需保活提交。"
+          fi
